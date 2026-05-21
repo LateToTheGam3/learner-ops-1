@@ -1,0 +1,388 @@
+"""
+Content generation + verification engine.
+
+Two-pass system:
+  Pass 1: generate(concept, level) -> text          (web search enabled)
+  Pass 2: verify(text)            -> text, stats    (web search enabled, math checked)
+
+All Claude calls include the web_search_20250305 tool.
+"""
+import asyncio
+import json
+import re
+from typing import Tuple, Dict, Any, Optional, List
+
+from anthropic import Anthropic
+import config
+
+
+_client: Optional[Anthropic] = None
+
+
+def client() -> Anthropic:
+    global _client
+    if _client is None:
+        _client = Anthropic(api_key=config.ANTHROPIC_API_KEY)
+    return _client
+
+
+# -----------------------------------------------------------------------------
+# Low-level Claude call with retry
+# -----------------------------------------------------------------------------
+async def _call_claude(
+    system: str,
+    user: str,
+    max_tokens: int,
+    use_web_search: bool = True,
+) -> str:
+    """Single call to Claude with optional web search. Retries once on failure."""
+
+    def _go():
+        kwargs = {
+            "model": config.CLAUDE_MODEL,
+            "max_tokens": max_tokens,
+            "system": system,
+            "messages": [{"role": "user", "content": user}],
+        }
+        if use_web_search:
+            kwargs["tools"] = [config.WEB_SEARCH_TOOL]
+        resp = client().messages.create(**kwargs)
+        # Concatenate all text blocks from the final response
+        out = []
+        for block in resp.content:
+            if getattr(block, "type", None) == "text":
+                out.append(block.text)
+        return "\n".join(out).strip()
+
+    last_err = None
+    for attempt in range(config.RETRY_ATTEMPTS):
+        try:
+            return await asyncio.to_thread(_go)
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            await asyncio.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"Claude API failed after {config.RETRY_ATTEMPTS} attempts: {last_err}")
+
+
+# -----------------------------------------------------------------------------
+# Prompts
+# -----------------------------------------------------------------------------
+TEACHING_RULES = """\
+You are MasteryBot, teaching finance/consulting/VC/PE/investing from the ground up.
+
+Assume the learner knows NOTHING. Build from zero.
+Every new term must include a plain-English explanation in brackets the first time
+it appears, with the business term in brackets after, e.g.
+"how much money is left after making the product (this is called Gross Profit)."
+
+ABSOLUTE RULES:
+- No jargon without immediate plain-English explanation in brackets on first use.
+- No motivational filler. Every sentence teaches.
+- Every concept has a REAL company example with REAL numbers, named and specific.
+- Every concept has an analogy from everyday life.
+- Every formula must include a worked numerical example. Show the maths step by step.
+- Verify your maths. Every number you write must be correct.
+- The quick check must have ONE unambiguous answer.
+- Output length 150-400 words. Dense, no padding.
+- Use the exact section structure shown below.
+"""
+
+
+CONCEPT_TEMPLATE = """\
+📚 [Subject] → [Module] → [Concept Name]
+
+WHAT IT IS:
+[1-2 sentences. Plain English. No jargon.]
+(This is called "[business term]" in business/finance.)
+
+WHY IT MATTERS:
+[Who looks at this? What decisions depend on it? Be specific —
+"PE investors use this to..." not "this is important."]
+
+HOW IT WORKS:
+[Mechanics. If there's a formula, show it with worked numbers — first round numbers,
+then a real company.]
+
+Formula: [plain English name] = [components in plain English]
+Worked example: [step by step with actual numbers, one clear answer]
+
+EXAMPLE:
+[Real company, real situation, real numbers. Named. Specific.]
+
+ANALOGY:
+[Something intuitive from everyday life that locks it in.]
+
+CONNECTS TO:
+← [prereq knowledge]
+→ [what this leads to next]
+
+💡 Quick check: [ONE question with ONE unambiguous answer]
+"""
+
+
+LEVEL_HINTS = {
+    1: "Level 1 — basic. Define, give one formula, one real example, one analogy.",
+    2: "Level 2 — applied. Use a recent real company. Show full calculations.",
+    3: "Level 3 — edge cases. Where this metric misleads. Cross-concept connections.",
+    4: "Level 4 — expert. Second-order effects. Synthesis across statements.",
+    5: "Level 5 — mastery. Teach-quality. Spot loopholes and where smart investors find edge.",
+}
+
+
+def _build_generation_prompt(concept: Dict[str, Any], level: int) -> Tuple[str, str]:
+    system = TEACHING_RULES + "\n\nFollow this exact template:\n\n" + CONCEPT_TEMPLATE
+    level_hint = LEVEL_HINTS.get(level, LEVEL_HINTS[1])
+    user = (
+        f"Teach the concept: {concept['title']} (id: {concept['id']}).\n"
+        f"Subject: {concept['subject']}. Module: {concept['module']}.\n"
+        f"{level_hint}\n\n"
+        "Use web_search to find a recent real company example with real numbers.\n"
+        "Verify every number you cite. Show maths step by step.\n"
+        "Write the lesson now. Do not include any other commentary."
+    )
+    return system, user
+
+
+VERIFICATION_RULES = """\
+You are MasteryBot's verification pass. Your job is to make sure the lesson is correct,
+clear, and unambiguous before it is sent to the learner.
+
+Do the following:
+1. Extract every factual claim (numbers, dates, company names, deal details).
+2. Verify each via web_search where possible.
+3. Re-solve EVERY formula / calculation in the lesson independently. If the
+   maths don't match, FIX them and note the correction.
+4. Solve the quick-check question yourself. Confirm one unambiguous answer.
+5. Look for currency mixing errors (e.g. ₹ and $ in the same equation).
+6. Look for ambiguous wording that allows two valid interpretations.
+7. Flag anything unverifiable.
+
+Return a single JSON object on one line, then a separator line `---FINAL---`,
+then the corrected, final lesson text to send.
+
+JSON schema:
+{
+  "claims_total": int,
+  "claims_verified": int,
+  "claims_flagged": int,
+  "math_errors_found": int,
+  "flagged_details": "short description of any issues, or empty string"
+}
+
+Do not include any other commentary outside the JSON and the final lesson.
+"""
+
+
+def _build_verification_prompt(text: str) -> Tuple[str, str]:
+    system = VERIFICATION_RULES
+    user = "Here is the lesson to verify:\n\n" + text
+    return system, user
+
+
+# -----------------------------------------------------------------------------
+# Public API
+# -----------------------------------------------------------------------------
+async def generate_concept(concept: Dict[str, Any], level: int = 1) -> str:
+    """Pass 1 — generate raw lesson."""
+    system, user = _build_generation_prompt(concept, level)
+    return await _call_claude(system, user, config.MAX_TOKENS_GENERATION)
+
+
+async def verify_concept(text: str) -> Tuple[str, Dict[str, Any]]:
+    """Pass 2 — verify + correct. Returns (final_text, stats)."""
+    system, user = _build_verification_prompt(text)
+    raw = await _call_claude(system, user, config.MAX_TOKENS_VERIFICATION)
+    return _parse_verification(raw, fallback=text)
+
+
+def _parse_verification(raw: str, fallback: str) -> Tuple[str, Dict[str, Any]]:
+    """Parse the JSON + final text from the verification response."""
+    default_stats = {
+        "claims_total": 0,
+        "claims_verified": 0,
+        "claims_flagged": 0,
+        "math_errors_found": 0,
+        "flagged_details": "",
+    }
+    if "---FINAL---" not in raw:
+        # No separator returned — best effort: take any JSON we can find and
+        # use the rest as the final text.
+        stats = _extract_first_json(raw) or default_stats
+        text = re.sub(r"^\s*\{.*?\}\s*", "", raw, count=1, flags=re.DOTALL).strip()
+        if not text:
+            text = fallback
+        return text, {**default_stats, **stats}
+
+    json_part, _, final_part = raw.partition("---FINAL---")
+    stats = _extract_first_json(json_part) or default_stats
+    final_text = final_part.strip() or fallback
+    return final_text, {**default_stats, **stats}
+
+
+def _extract_first_json(text: str) -> Optional[Dict[str, Any]]:
+    """Find the first balanced JSON object in text and parse it."""
+    depth = 0
+    start = -1
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start >= 0:
+                try:
+                    return json.loads(text[start : i + 1])
+                except json.JSONDecodeError:
+                    start = -1
+    return None
+
+
+async def generate_and_verify(
+    concept: Dict[str, Any], level: int = 1
+) -> Tuple[str, Dict[str, Any]]:
+    """End-to-end: generate then verify. Returns (final_text, stats)."""
+    raw = await generate_concept(concept, level)
+    final, stats = await verify_concept(raw)
+    return final, stats
+
+
+# -----------------------------------------------------------------------------
+# Other modes
+# -----------------------------------------------------------------------------
+async def answer_followup(
+    original_lesson: str, question: str
+) -> str:
+    """Doubt-clearing reply mode."""
+    system = (
+        "You are MasteryBot answering a learner's follow-up question on a lesson "
+        "you just sent. Rules:\n"
+        "- Answer the SPECIFIC question only. 2-4 sentences max for the direct answer.\n"
+        "- If the original example didn't click, give ONE new example or analogy.\n"
+        "- Don't repeat the whole concept.\n"
+        "- If the question reveals a prerequisite gap, name it and give a one-line bridge.\n"
+        "- Use plain English. Explain any new jargon in brackets on first use.\n"
+        "- Verify any numbers you cite (web_search if needed)."
+    )
+    user = f"Original lesson:\n{original_lesson}\n\nLearner's question:\n{question}"
+    return await _call_claude(system, user, config.MAX_TOKENS_QA)
+
+
+async def generate_example(concept: Dict[str, Any]) -> str:
+    """/example — another worked real-world example."""
+    system = (
+        TEACHING_RULES
+        + "\n\nGenerate ANOTHER real-world example for an already-learned concept. "
+        "Use a DIFFERENT company than the one in the original lesson if you can. "
+        "Format: 1) one-sentence recap of the concept, 2) the new real example with real "
+        "numbers and a worked calculation, 3) what insight this example reveals. "
+        "150-300 words."
+    )
+    user = f"Concept: {concept['title']} (id: {concept['id']}). Give a new example now."
+    return await _call_claude(system, user, config.MAX_TOKENS_GENERATION)
+
+
+async def generate_formula(concept: Dict[str, Any]) -> str:
+    """/formula — just the formula + worked example."""
+    system = (
+        "You are MasteryBot. Give ONLY the formula and a tight worked example.\n"
+        "Format:\n"
+        "Formula (plain English): ...\n"
+        "Formula (symbolic): ...\n"
+        "Worked example (real company, real numbers, step by step):\n"
+        "Answer: ...\n"
+        "Verify your maths. No padding. 120-250 words."
+    )
+    user = f"Concept: {concept['title']} (id: {concept['id']})."
+    return await _call_claude(system, user, config.MAX_TOKENS_QA)
+
+
+async def generate_spaced_reminder(
+    concept: Dict[str, Any], days_ago: int
+) -> str:
+    """Spaced-repetition surface with a NEW application."""
+    system = (
+        "You are MasteryBot doing a spaced-repetition re-surfacing.\n"
+        "Format:\n"
+        f"🔄 {concept['title']} — you learned this {days_ago} day(s) ago.\n"
+        "Here's how it shows up somewhere different: [a NEW real example, named company, "
+        "real numbers, 2-4 sentences, verify any number].\n"
+        "💡 Quick check: [ONE application question with ONE unambiguous answer].\n"
+        "120-220 words."
+    )
+    user = f"Concept: {concept['title']} (id: {concept['id']}). Days since first taught: {days_ago}."
+    return await _call_claude(system, user, config.MAX_TOKENS_QA)
+
+
+# -----------------------------------------------------------------------------
+# Assessment helpers
+# -----------------------------------------------------------------------------
+async def generate_assessment_questions(
+    concept_ids: List[str], titles: List[str], num_questions: int = 10
+) -> str:
+    """Build an assessment over a list of recently-covered concepts."""
+    listing = "\n".join(f"- {cid}: {t}" for cid, t in zip(concept_ids, titles))
+    system = (
+        "You are MasteryBot generating a learner assessment.\n"
+        f"Generate exactly {num_questions} questions across the following covered concepts:\n"
+        f"{listing}\n\n"
+        "Mix: ~30% recall (definitions/formulas), ~50% application (given a scenario, "
+        "what number / what would you look at / why), ~20% connection (how A relates to B).\n"
+        "Each question must have one unambiguous answer.\n"
+        "Format each question:\n"
+        "Q<n>. [question]\n"
+        "   (type: recall|application|connection; concept_id: <id>)\n"
+        "Do not include answers. End with: 'Reply with your answers in order.'"
+    )
+    user = "Generate the assessment now."
+    return await _call_claude(system, user, config.MAX_TOKENS_GENERATION, use_web_search=False)
+
+
+async def score_assessment(
+    questions_text: str, learner_answers: str
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """Score a learner's answers. Returns (markdown_summary, per_question_records)."""
+    system = (
+        "You are MasteryBot scoring a learner's assessment answers.\n"
+        "For each question:\n"
+        "- Decide score 1-5 on reasoning quality (1 = wrong/blank, 3 = correct but shallow, "
+        "5 = correct with sharp reasoning).\n"
+        "- Give one-sentence feedback.\n"
+        "Return a single JSON array on one line, then '---SUMMARY---', then a short "
+        "markdown summary for the learner.\n\n"
+        "JSON schema (array): [{question_number:int, concept_id:string, type:string, "
+        "score:int, feedback:string}]"
+    )
+    user = (
+        "Questions:\n"
+        + questions_text
+        + "\n\nLearner answers:\n"
+        + learner_answers
+    )
+    raw = await _call_claude(system, user, config.MAX_TOKENS_VERIFICATION, use_web_search=False)
+    return _parse_score(raw)
+
+
+def _parse_score(raw: str) -> Tuple[str, List[Dict[str, Any]]]:
+    if "---SUMMARY---" in raw:
+        json_part, _, summary = raw.partition("---SUMMARY---")
+    else:
+        json_part, summary = raw, ""
+    records: List[Dict[str, Any]] = []
+    # find first [...] block
+    depth = 0
+    start = -1
+    for i, ch in enumerate(json_part):
+        if ch == "[":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0 and start >= 0:
+                try:
+                    records = json.loads(json_part[start : i + 1])
+                except json.JSONDecodeError:
+                    records = []
+                break
+    return summary.strip() or "Scored.", records
