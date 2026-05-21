@@ -10,11 +10,26 @@ TELEGRAM_TOKEN = os.getenv("MASTERY_BOT_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 CHAT_ID = os.getenv("MASTERY_CHAT_ID")
 
-# Model
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
-MAX_TOKENS_GENERATION = 2000
-MAX_TOKENS_VERIFICATION = 3000
+# Models — Sonnet only for Pass 1 (quality matters); Haiku for cheaper passes.
+CLAUDE_MODEL = "claude-sonnet-4-20250514"            # Pass 1: generation
+CLAUDE_MODEL_VERIFY = "claude-haiku-4-5-20251001"    # Pass 2: verification
+CLAUDE_MODEL_QA = "claude-haiku-4-5-20251001"        # Reply Q&A + formula/spaced
+
+MAX_TOKENS_GENERATION = 1200
+MAX_TOKENS_VERIFICATION = 800
 MAX_TOKENS_QA = 800
+
+# Per-million-token pricing (USD). Used by content_engine for /cost tracking.
+PRICING = {
+    "claude-sonnet-4-20250514":   {"input": 3.00, "output": 15.00},
+    "claude-haiku-4-5-20251001":  {"input": 1.00, "output":  5.00},
+}
+
+# Pause between Pass 1 (generate) and Pass 2 (verify) to avoid burst rate limits.
+INTER_PASS_DELAY_SECONDS = 5.0
+
+# Backoff when the API returns 429 (rate limit).
+RATE_LIMIT_BACKOFF_SECONDS = 60
 
 # Web search tool spec
 WEB_SEARCH_TOOL = {
@@ -43,7 +58,7 @@ SR_INTERVALS = [1, 3, 7, 14, 30]
 DB_PATH = os.path.join(os.path.dirname(__file__), "mastery.db")
 
 # Retry policy
-RETRY_ATTEMPTS = 2
+RETRY_ATTEMPTS = 3
 
 # Difficulty levels per subject (1..5)
 DEFAULT_LEVEL = 1

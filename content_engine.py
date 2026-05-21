@@ -12,6 +12,7 @@ import json
 import re
 from typing import Tuple, Dict, Any, Optional, List
 
+import anthropic
 from anthropic import Anthropic
 import config
 
@@ -27,19 +28,72 @@ def client() -> Anthropic:
 
 
 # -----------------------------------------------------------------------------
-# Low-level Claude call with retry
+# Cost tracking (process-lifetime; exposed via /cost)
 # -----------------------------------------------------------------------------
+_cost_state: Dict[str, Any] = {
+    "calls": 0,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cost_usd": 0.0,
+    "by_model": {},  # model -> {calls, input_tokens, output_tokens, cost_usd}
+}
+
+
+def get_cost_stats() -> Dict[str, Any]:
+    """Snapshot of API cost since process start."""
+    return {
+        "calls": _cost_state["calls"],
+        "input_tokens": _cost_state["input_tokens"],
+        "output_tokens": _cost_state["output_tokens"],
+        "cost_usd": round(_cost_state["cost_usd"], 4),
+        "by_model": {
+            m: {**v, "cost_usd": round(v["cost_usd"], 4)}
+            for m, v in _cost_state["by_model"].items()
+        },
+    }
+
+
+def _record_usage(model: str, input_tokens: int, output_tokens: int) -> None:
+    pricing = config.PRICING.get(model, {"input": 0.0, "output": 0.0})
+    cost = (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
+    _cost_state["calls"] += 1
+    _cost_state["input_tokens"] += input_tokens
+    _cost_state["output_tokens"] += output_tokens
+    _cost_state["cost_usd"] += cost
+    m = _cost_state["by_model"].setdefault(
+        model, {"calls": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+    )
+    m["calls"] += 1
+    m["input_tokens"] += input_tokens
+    m["output_tokens"] += output_tokens
+    m["cost_usd"] += cost
+
+
+# -----------------------------------------------------------------------------
+# Low-level Claude call with retry + 429 backoff
+# -----------------------------------------------------------------------------
+def _is_rate_limit(err: Exception) -> bool:
+    if isinstance(err, anthropic.RateLimitError):
+        return True
+    status = getattr(err, "status_code", None)
+    if status == 429:
+        return True
+    return "429" in str(err)
+
+
 async def _call_claude(
     system: str,
     user: str,
     max_tokens: int,
     use_web_search: bool = True,
+    model: Optional[str] = None,
 ) -> str:
-    """Single call to Claude with optional web search. Retries once on failure."""
+    """Single call to Claude. Retries with 60s backoff on 429, short backoff otherwise."""
+    model = model or config.CLAUDE_MODEL
 
     def _go():
         kwargs = {
-            "model": config.CLAUDE_MODEL,
+            "model": model,
             "max_tokens": max_tokens,
             "system": system,
             "messages": [{"role": "user", "content": user}],
@@ -47,20 +101,33 @@ async def _call_claude(
         if use_web_search:
             kwargs["tools"] = [config.WEB_SEARCH_TOOL]
         resp = client().messages.create(**kwargs)
-        # Concatenate all text blocks from the final response
+        # Record usage for /cost
+        try:
+            usage = getattr(resp, "usage", None)
+            if usage is not None:
+                _record_usage(
+                    model,
+                    int(getattr(usage, "input_tokens", 0) or 0),
+                    int(getattr(usage, "output_tokens", 0) or 0),
+                )
+        except Exception:  # noqa: BLE001
+            pass
         out = []
         for block in resp.content:
             if getattr(block, "type", None) == "text":
                 out.append(block.text)
         return "\n".join(out).strip()
 
-    last_err = None
+    last_err: Optional[Exception] = None
     for attempt in range(config.RETRY_ATTEMPTS):
         try:
             return await asyncio.to_thread(_go)
         except Exception as e:  # noqa: BLE001
             last_err = e
-            await asyncio.sleep(1.5 * (attempt + 1))
+            if _is_rate_limit(e):
+                await asyncio.sleep(config.RATE_LIMIT_BACKOFF_SECONDS)
+            else:
+                await asyncio.sleep(1.5 * (attempt + 1))
     raise RuntimeError(f"Claude API failed after {config.RETRY_ATTEMPTS} attempts: {last_err}")
 
 
@@ -189,9 +256,14 @@ async def generate_concept(concept: Dict[str, Any], level: int = 1) -> str:
 
 
 async def verify_concept(text: str) -> Tuple[str, Dict[str, Any]]:
-    """Pass 2 — verify + correct. Returns (final_text, stats)."""
+    """Pass 2 — verify + correct. Runs on the cheaper Haiku model."""
     system, user = _build_verification_prompt(text)
-    raw = await _call_claude(system, user, config.MAX_TOKENS_VERIFICATION)
+    raw = await _call_claude(
+        system,
+        user,
+        config.MAX_TOKENS_VERIFICATION,
+        model=config.CLAUDE_MODEL_VERIFY,
+    )
     return _parse_verification(raw, fallback=text)
 
 
@@ -243,6 +315,8 @@ async def generate_and_verify(
 ) -> Tuple[str, Dict[str, Any]]:
     """End-to-end: generate then verify. Returns (final_text, stats)."""
     raw = await generate_concept(concept, level)
+    # Avoid back-to-back bursts that trip per-minute limits.
+    await asyncio.sleep(config.INTER_PASS_DELAY_SECONDS)
     final, stats = await verify_concept(raw)
     return final, stats
 
@@ -265,7 +339,9 @@ async def answer_followup(
         "- Verify any numbers you cite (web_search if needed)."
     )
     user = f"Original lesson:\n{original_lesson}\n\nLearner's question:\n{question}"
-    return await _call_claude(system, user, config.MAX_TOKENS_QA)
+    return await _call_claude(
+        system, user, config.MAX_TOKENS_QA, model=config.CLAUDE_MODEL_QA
+    )
 
 
 async def generate_example(concept: Dict[str, Any]) -> str:

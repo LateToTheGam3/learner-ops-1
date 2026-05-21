@@ -154,7 +154,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/review — 5 quick-fire questions\n"
         "/test — full 10-question assessment\n"
         "/weak — content from your weakest area\n"
-        "/score — assessment averages\n\n"
+        "/score — assessment averages\n"
+        "/cost — estimated API spend so far\n\n"
         "Reply to any of my messages with a question to clarify."
     )
     await _send(context, update.effective_chat.id, text)
@@ -387,6 +388,26 @@ async def cmd_weak(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = await asm.score_report()
     await _send(context, update.effective_chat.id, text)
+
+
+async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Estimated Anthropic API spend since this process started."""
+    stats = content_engine.get_cost_stats()
+    lines = [
+        "💰 API spend (since bot start)",
+        f"Total: ${stats['cost_usd']:.4f}  ({stats['calls']} calls)",
+        f"  input tokens:  {stats['input_tokens']:,}",
+        f"  output tokens: {stats['output_tokens']:,}",
+    ]
+    if stats["by_model"]:
+        lines.append("")
+        lines.append("By model:")
+        for model, m in stats["by_model"].items():
+            lines.append(
+                f"  • {model}: ${m['cost_usd']:.4f}  "
+                f"({m['calls']} calls, in {m['input_tokens']:,} / out {m['output_tokens']:,})"
+            )
+    await _send(context, update.effective_chat.id, "\n".join(lines))
 
 
 # -----------------------------------------------------------------------------
@@ -653,6 +674,7 @@ def main():
     app.add_handler(CommandHandler("test", cmd_test))
     app.add_handler(CommandHandler("weak", cmd_weak))
     app.add_handler(CommandHandler("score", cmd_score))
+    app.add_handler(CommandHandler("cost", cmd_cost))
 
     # Reply handler — any non-command text that's a reply
     app.add_handler(
