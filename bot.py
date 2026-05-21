@@ -111,26 +111,33 @@ async def _deliver_concept(context, chat_id: int, concept: dict):
         await _send(context, chat_id, f"⚠️ Couldn't generate {concept['title']}: {e}")
         return
 
-    content_id = await db.log_content(
-        subject_id=concept["subject"],
-        concept_id=concept["id"],
-        text=text,
-        verified=True,
-        math_verified=(stats.get("math_errors_found", 0) == 0),
-    )
-    await db.log_verification(
-        content_id=content_id,
-        claims_total=int(stats.get("claims_total", 0) or 0),
-        claims_verified=int(stats.get("claims_verified", 0) or 0),
-        claims_flagged=int(stats.get("claims_flagged", 0) or 0),
-        math_errors=int(stats.get("math_errors_found", 0) or 0),
-        flagged_details=str(stats.get("flagged_details", "") or ""),
-    )
+    content_id: Optional[int] = None
+    try:
+        content_id = await db.log_content(
+            subject_id=concept["subject"],
+            concept_id=concept["id"],
+            text=text,
+            verified=True,
+            math_verified=(stats.get("math_errors_found", 0) == 0),
+        )
+        await db.log_verification(
+            content_id=content_id,
+            claims_total=int(stats.get("claims_total", 0) or 0),
+            claims_verified=int(stats.get("claims_verified", 0) or 0),
+            claims_flagged=int(stats.get("claims_flagged", 0) or 0),
+            math_errors=int(stats.get("math_errors_found", 0) or 0),
+            flagged_details=str(stats.get("flagged_details", "") or ""),
+        )
+    except Exception:
+        log.exception("DB logging failed for %s; continuing delivery", concept["id"])
+
+    await _send(context, chat_id, text, content_id=content_id)
+
+    # Mark progress AFTER the message is sent so /next always advances correctly.
     await db.set_progress(concept["id"], "introduced")
     await sr.schedule_after_introduction(concept["id"])
     await db.update_streak()
     await db.set_state(_CURRENT_SUBJECT_KEY, concept["subject"])
-    await _send(context, chat_id, text, content_id=content_id)
 
 
 # -----------------------------------------------------------------------------

@@ -132,22 +132,32 @@ async def get_progress(concept_id: str) -> Optional[Dict[str, Any]]:
 
 
 async def set_progress(concept_id: str, state: str):
+    from curriculum import get_concept as _gc
+    c = _gc(concept_id)
+    subject_id = c["subject"] if c else ""
+    module_id = c["module"] if c else ""
     now = now_iso()
     async with aiosqlite.connect(config.DB_PATH) as db:
         if state == "introduced":
             await db.execute(
-                """UPDATE curriculum_progress
-                   SET state = ?, introduced_at = COALESCE(introduced_at, ?),
-                       last_reviewed = ?
-                   WHERE concept_id = ?""",
-                (state, now, now, concept_id),
+                """INSERT INTO curriculum_progress
+                   (concept_id, subject_id, module_id, state, introduced_at, last_reviewed)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(concept_id) DO UPDATE
+                   SET state = excluded.state,
+                       introduced_at = COALESCE(curriculum_progress.introduced_at,
+                                                excluded.introduced_at),
+                       last_reviewed = excluded.last_reviewed""",
+                (concept_id, subject_id, module_id, state, now, now),
             )
         else:
             await db.execute(
-                """UPDATE curriculum_progress
-                   SET state = ?, last_reviewed = ?
-                   WHERE concept_id = ?""",
-                (state, now, concept_id),
+                """INSERT INTO curriculum_progress
+                   (concept_id, subject_id, module_id, state, last_reviewed)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(concept_id) DO UPDATE
+                   SET state = excluded.state, last_reviewed = excluded.last_reviewed""",
+                (concept_id, subject_id, module_id, state, now),
             )
         await db.commit()
 

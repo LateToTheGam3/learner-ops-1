@@ -15,8 +15,8 @@ CLAUDE_MODEL = "claude-sonnet-4-20250514"            # Pass 1: generation
 CLAUDE_MODEL_VERIFY = "claude-haiku-4-5-20251001"    # Pass 2: verification
 CLAUDE_MODEL_QA = "claude-haiku-4-5-20251001"        # Reply Q&A + formula/spaced
 
-MAX_TOKENS_GENERATION = 1200
-MAX_TOKENS_VERIFICATION = 800
+MAX_TOKENS_GENERATION = 2000
+MAX_TOKENS_VERIFICATION = 2000
 MAX_TOKENS_QA = 800
 
 # Per-million-token pricing (USD). Used by content_engine for /cost tracking.
