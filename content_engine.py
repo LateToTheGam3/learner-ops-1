@@ -1,15 +1,24 @@
 """
-Content generation + verification engine.
+Content generation + verification engine — with per-call cost tracking.
 
 Two-pass system:
   Pass 1: generate(concept, level) -> text          (web search enabled)
   Pass 2: verify(text)            -> text, stats    (web search enabled, math checked)
 
-All Claude calls include the web_search_20250305 tool.
+Model routing (cost optimisation):
+  Level 1-2 concepts → CLAUDE_MODEL_FAST (Haiku)  ~$0.005-0.02 per call
+  Level 3+ concepts  → CLAUDE_MODEL      (Sonnet) ~$0.05-0.10 per call
+  Haiku is 3-5× cheaper on output and produces quality output for basic concepts.
+
+Cost tracking:
+  _recent_calls deque  — last 50 calls in-memory; shown by /cost
+  api_call_log table   — every call persisted to DB; survives restarts
 """
 import asyncio
+import datetime as dt
 import json
 import re
+from collections import deque
 from typing import Tuple, Dict, Any, Optional, List
 
 import anthropic
@@ -28,15 +37,52 @@ def client() -> Anthropic:
 
 
 # -----------------------------------------------------------------------------
-# Cost tracking (process-lifetime; exposed via /cost)
+# Cost tracking (process-lifetime totals + per-call ring buffer)
 # -----------------------------------------------------------------------------
 _cost_state: Dict[str, Any] = {
     "calls": 0,
     "input_tokens": 0,
     "output_tokens": 0,
     "cost_usd": 0.0,
-    "by_model": {},  # model -> {calls, input_tokens, output_tokens, cost_usd}
+    "by_model": {},
 }
+
+_recent_calls: deque = deque(maxlen=50)  # cleared on bot restart; DB has the full history
+
+
+def _record_usage(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    call_type: str = "unknown",
+    concept_id: str = "",
+) -> float:
+    """Update in-memory totals and per-call log. Returns cost in USD for this call."""
+    pricing = config.PRICING.get(model, {"input": 0.0, "output": 0.0})
+    cost = (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
+    _cost_state["calls"] += 1
+    _cost_state["input_tokens"] += input_tokens
+    _cost_state["output_tokens"] += output_tokens
+    _cost_state["cost_usd"] += cost
+    m = _cost_state["by_model"].setdefault(
+        model, {"calls": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+    )
+    m["calls"] += 1
+    m["input_tokens"] += input_tokens
+    m["output_tokens"] += output_tokens
+    m["cost_usd"] += cost
+    _recent_calls.append(
+        {
+            "ts": dt.datetime.now().strftime("%H:%M"),
+            "call_type": call_type,
+            "concept_id": concept_id or "—",
+            "model": model,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cost_usd": cost,
+        }
+    )
+    return cost
 
 
 def get_cost_stats() -> Dict[str, Any]:
@@ -53,20 +99,10 @@ def get_cost_stats() -> Dict[str, Any]:
     }
 
 
-def _record_usage(model: str, input_tokens: int, output_tokens: int) -> None:
-    pricing = config.PRICING.get(model, {"input": 0.0, "output": 0.0})
-    cost = (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
-    _cost_state["calls"] += 1
-    _cost_state["input_tokens"] += input_tokens
-    _cost_state["output_tokens"] += output_tokens
-    _cost_state["cost_usd"] += cost
-    m = _cost_state["by_model"].setdefault(
-        model, {"calls": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
-    )
-    m["calls"] += 1
-    m["input_tokens"] += input_tokens
-    m["output_tokens"] += output_tokens
-    m["cost_usd"] += cost
+def get_recent_calls(limit: int = 10) -> List[Dict[str, Any]]:
+    """Return the most recent calls, newest first."""
+    calls = list(_recent_calls)
+    return list(reversed(calls))[:limit]
 
 
 # -----------------------------------------------------------------------------
@@ -87,12 +123,17 @@ async def _call_claude(
     max_tokens: int,
     use_web_search: bool = True,
     model: Optional[str] = None,
+    call_type: str = "unknown",
+    concept_id: str = "",
 ) -> str:
-    """Single call to Claude. Retries with 60s backoff on 429, short backoff otherwise."""
+    """
+    Single call to Claude. Retries with backoff on errors.
+    Records per-call token usage + cost to both in-memory ring buffer and DB.
+    """
     model = model or config.CLAUDE_MODEL
 
-    def _go():
-        kwargs = {
+    def _go() -> Tuple[str, int, int]:
+        kwargs: Dict[str, Any] = {
             "model": model,
             "max_tokens": max_tokens,
             "system": system,
@@ -101,27 +142,30 @@ async def _call_claude(
         if use_web_search:
             kwargs["tools"] = [config.WEB_SEARCH_TOOL]
         resp = client().messages.create(**kwargs)
-        # Record usage for /cost
-        try:
-            usage = getattr(resp, "usage", None)
-            if usage is not None:
-                _record_usage(
-                    model,
-                    int(getattr(usage, "input_tokens", 0) or 0),
-                    int(getattr(usage, "output_tokens", 0) or 0),
-                )
-        except Exception:  # noqa: BLE001
-            pass
-        out = []
-        for block in resp.content:
-            if getattr(block, "type", None) == "text":
-                out.append(block.text)
-        return "\n".join(out).strip()
+        usage = getattr(resp, "usage", None)
+        in_tok = int(getattr(usage, "input_tokens", 0) or 0) if usage else 0
+        out_tok = int(getattr(usage, "output_tokens", 0) or 0) if usage else 0
+        out = [
+            block.text
+            for block in resp.content
+            if getattr(block, "type", None) == "text"
+        ]
+        return "\n".join(out).strip(), in_tok, out_tok
 
     last_err: Optional[Exception] = None
     for attempt in range(config.RETRY_ATTEMPTS):
         try:
-            return await asyncio.to_thread(_go)
+            text, in_tok, out_tok = await asyncio.to_thread(_go)
+            cost = _record_usage(model, in_tok, out_tok, call_type, concept_id)
+            # Persist to DB — fire-and-forget; a DB failure must never break delivery
+            try:
+                import database as _db  # lazy import avoids module-load ordering issues
+                asyncio.create_task(
+                    _db.log_api_call(call_type, concept_id, model, in_tok, out_tok, cost)
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return text
         except Exception as e:  # noqa: BLE001
             last_err = e
             if _is_rate_limit(e):
@@ -250,19 +294,29 @@ def _build_verification_prompt(text: str) -> Tuple[str, str]:
 # Public API
 # -----------------------------------------------------------------------------
 async def generate_concept(concept: Dict[str, Any], level: int = 1) -> str:
-    """Pass 1 — generate raw lesson."""
+    """Pass 1 — generate raw lesson.
+    Uses Haiku for level 1-2 (cheap, still high quality for basics),
+    Sonnet for level 3+ (complex edge-case / synthesis content).
+    """
+    model = (
+        config.CLAUDE_MODEL_FAST
+        if level <= config.FAST_MODEL_MAX_LEVEL
+        else config.CLAUDE_MODEL
+    )
     system, user = _build_generation_prompt(concept, level)
-    return await _call_claude(system, user, config.MAX_TOKENS_GENERATION)
+    return await _call_claude(
+        system, user, config.MAX_TOKENS_GENERATION,
+        model=model, call_type="generation", concept_id=concept.get("id", ""),
+    )
 
 
-async def verify_concept(text: str) -> Tuple[str, Dict[str, Any]]:
+async def verify_concept(text: str, concept_id: str = "") -> Tuple[str, Dict[str, Any]]:
     """Pass 2 — verify + correct. Runs on the cheaper Haiku model."""
     system, user = _build_verification_prompt(text)
     raw = await _call_claude(
-        system,
-        user,
-        config.MAX_TOKENS_VERIFICATION,
+        system, user, config.MAX_TOKENS_VERIFICATION,
         model=config.CLAUDE_MODEL_VERIFY,
+        call_type="verification", concept_id=concept_id,
     )
     return _parse_verification(raw, fallback=text)
 
@@ -277,8 +331,6 @@ def _parse_verification(raw: str, fallback: str) -> Tuple[str, Dict[str, Any]]:
         "flagged_details": "",
     }
     if "---FINAL---" not in raw:
-        # No separator returned — best effort: take any JSON we can find and
-        # use the rest as the final text.
         stats = _extract_first_json(raw) or default_stats
         text = re.sub(r"^\s*\{.*?\}\s*", "", raw, count=1, flags=re.DOTALL).strip()
         if not text:
@@ -315,18 +367,15 @@ async def generate_and_verify(
 ) -> Tuple[str, Dict[str, Any]]:
     """End-to-end: generate then verify. Returns (final_text, stats)."""
     raw = await generate_concept(concept, level)
-    # Avoid back-to-back bursts that trip per-minute limits.
     await asyncio.sleep(config.INTER_PASS_DELAY_SECONDS)
-    final, stats = await verify_concept(raw)
+    final, stats = await verify_concept(raw, concept_id=concept.get("id", ""))
     return final, stats
 
 
 # -----------------------------------------------------------------------------
 # Other modes
 # -----------------------------------------------------------------------------
-async def answer_followup(
-    original_lesson: str, question: str
-) -> str:
+async def answer_followup(original_lesson: str, question: str) -> str:
     """Doubt-clearing reply mode."""
     system = (
         "You are MasteryBot answering a learner's follow-up question on a lesson "
@@ -340,7 +389,8 @@ async def answer_followup(
     )
     user = f"Original lesson:\n{original_lesson}\n\nLearner's question:\n{question}"
     return await _call_claude(
-        system, user, config.MAX_TOKENS_QA, model=config.CLAUDE_MODEL_QA
+        system, user, config.MAX_TOKENS_QA,
+        model=config.CLAUDE_MODEL_QA, call_type="qa",
     )
 
 
@@ -355,7 +405,10 @@ async def generate_example(concept: Dict[str, Any]) -> str:
         "150-300 words."
     )
     user = f"Concept: {concept['title']} (id: {concept['id']}). Give a new example now."
-    return await _call_claude(system, user, config.MAX_TOKENS_GENERATION)
+    return await _call_claude(
+        system, user, config.MAX_TOKENS_GENERATION,
+        call_type="example", concept_id=concept.get("id", ""),
+    )
 
 
 async def generate_formula(concept: Dict[str, Any]) -> str:
@@ -370,12 +423,13 @@ async def generate_formula(concept: Dict[str, Any]) -> str:
         "Verify your maths. No padding. 120-250 words."
     )
     user = f"Concept: {concept['title']} (id: {concept['id']})."
-    return await _call_claude(system, user, config.MAX_TOKENS_QA)
+    return await _call_claude(
+        system, user, config.MAX_TOKENS_QA,
+        call_type="formula", concept_id=concept.get("id", ""),
+    )
 
 
-async def generate_spaced_reminder(
-    concept: Dict[str, Any], days_ago: int
-) -> str:
+async def generate_spaced_reminder(concept: Dict[str, Any], days_ago: int) -> str:
     """Spaced-repetition surface with a NEW application."""
     system = (
         "You are MasteryBot doing a spaced-repetition re-surfacing.\n"
@@ -387,7 +441,10 @@ async def generate_spaced_reminder(
         "120-220 words."
     )
     user = f"Concept: {concept['title']} (id: {concept['id']}). Days since first taught: {days_ago}."
-    return await _call_claude(system, user, config.MAX_TOKENS_QA)
+    return await _call_claude(
+        system, user, config.MAX_TOKENS_QA,
+        call_type="spaced", concept_id=concept.get("id", ""),
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -411,7 +468,10 @@ async def generate_assessment_questions(
         "Do not include answers. End with: 'Reply with your answers in order.'"
     )
     user = "Generate the assessment now."
-    return await _call_claude(system, user, config.MAX_TOKENS_GENERATION, use_web_search=False)
+    return await _call_claude(
+        system, user, config.MAX_TOKENS_GENERATION,
+        use_web_search=False, call_type="assessment_gen",
+    )
 
 
 async def score_assessment(
@@ -435,7 +495,10 @@ async def score_assessment(
         + "\n\nLearner answers:\n"
         + learner_answers
     )
-    raw = await _call_claude(system, user, config.MAX_TOKENS_VERIFICATION, use_web_search=False)
+    raw = await _call_claude(
+        system, user, config.MAX_TOKENS_VERIFICATION,
+        use_web_search=False, call_type="assessment_score",
+    )
     return _parse_score(raw)
 
 
@@ -445,7 +508,6 @@ def _parse_score(raw: str) -> Tuple[str, List[Dict[str, Any]]]:
     else:
         json_part, summary = raw, ""
     records: List[Dict[str, Any]] = []
-    # find first [...] block
     depth = 0
     start = -1
     for i, ch in enumerate(json_part):

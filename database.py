@@ -81,6 +81,17 @@ CREATE TABLE IF NOT EXISTS state (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+
+CREATE TABLE IF NOT EXISTS api_call_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    call_type TEXT,
+    concept_id TEXT,
+    model TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL NOT NULL DEFAULT 0.0
+);
 """
 
 
@@ -488,3 +499,36 @@ async def update_streak() -> int:
 async def get_streak() -> int:
     s = await get_state("streak")
     return int(s) if s else 0
+
+
+# -----------------------------------------------------------------------------
+# Per-call API cost log
+# -----------------------------------------------------------------------------
+async def log_api_call(
+    call_type: str,
+    concept_id: str,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cost_usd: float,
+):
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO api_call_log
+               (timestamp, call_type, concept_id, model,
+                input_tokens, output_tokens, cost_usd)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (now_iso(), call_type, concept_id, model,
+             input_tokens, output_tokens, cost_usd),
+        )
+        await db.commit()
+
+
+async def recent_api_calls(limit: int = 20) -> List[Dict[str, Any]]:
+    """Return the most recent API calls, newest first."""
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM api_call_log ORDER BY id DESC LIMIT ?", (limit,)
+        ) as cur:
+            return [dict(r) async for r in cur]

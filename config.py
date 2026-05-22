@@ -10,10 +10,15 @@ TELEGRAM_TOKEN = os.getenv("MASTERY_BOT_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 CHAT_ID = os.getenv("MASTERY_CHAT_ID")
 
-# Models — Sonnet only for Pass 1 (quality matters); Haiku for cheaper passes.
-CLAUDE_MODEL = "claude-sonnet-4-20250514"            # Pass 1: generation
-CLAUDE_MODEL_VERIFY = "claude-haiku-4-5-20251001"    # Pass 2: verification
-CLAUDE_MODEL_QA = "claude-haiku-4-5-20251001"        # Reply Q&A + formula/spaced
+# Models
+CLAUDE_MODEL       = "claude-sonnet-4-20250514"    # generation for level 3+ concepts
+CLAUDE_MODEL_FAST  = "claude-haiku-4-5-20251001"   # generation for level 1-2 concepts (cheaper)
+CLAUDE_MODEL_VERIFY = "claude-haiku-4-5-20251001"  # Pass 2: verification
+CLAUDE_MODEL_QA    = "claude-haiku-4-5-20251001"   # Reply Q&A + formula/spaced
+
+# Concepts at this level or below use CLAUDE_MODEL_FAST for generation.
+# Raise to 0 to always use Sonnet; set to 5 to always use Haiku.
+FAST_MODEL_MAX_LEVEL = 2
 
 MAX_TOKENS_GENERATION = 2000
 MAX_TOKENS_VERIFICATION = 2000
@@ -32,10 +37,12 @@ INTER_PASS_DELAY_SECONDS = 5.0
 RATE_LIMIT_BACKOFF_SECONDS = 60
 
 # Web search tool spec
+# max_uses=2: each search returns ~3-5 k tokens of context that counts as input.
+# 5 searches was the single biggest cost driver (~$0.10-0.15 per call in input alone).
 WEB_SEARCH_TOOL = {
     "type": "web_search_20250305",
     "name": "web_search",
-    "max_uses": 5,
+    "max_uses": 2,
 }
 
 # Timezone

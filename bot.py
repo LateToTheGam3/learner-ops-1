@@ -398,21 +398,39 @@ async def cmd_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Estimated Anthropic API spend since this process started."""
+    """Estimated Anthropic API spend — totals + per-call breakdown."""
     stats = content_engine.get_cost_stats()
+    recent = content_engine.get_recent_calls(12)
+
+    def _short(model: str) -> str:
+        # "claude-sonnet-4-20250514" → "sonnet-4"
+        parts = model.split("-")
+        try:
+            return f"{parts[1]}-{parts[2]}"
+        except IndexError:
+            return model
+
     lines = [
         "💰 API spend (since bot start)",
         f"Total: ${stats['cost_usd']:.4f}  ({stats['calls']} calls)",
-        f"  input tokens:  {stats['input_tokens']:,}",
-        f"  output tokens: {stats['output_tokens']:,}",
+        f"  input:  {stats['input_tokens']:,} tokens",
+        f"  output: {stats['output_tokens']:,} tokens",
     ]
     if stats["by_model"]:
-        lines.append("")
-        lines.append("By model:")
+        lines += ["", "By model:"]
         for model, m in stats["by_model"].items():
             lines.append(
-                f"  • {model}: ${m['cost_usd']:.4f}  "
-                f"({m['calls']} calls, in {m['input_tokens']:,} / out {m['output_tokens']:,})"
+                f"  • {_short(model)}: ${m['cost_usd']:.4f}"
+                f"  ({m['calls']} calls"
+                f"  in {m['input_tokens']:,} / out {m['output_tokens']:,})"
+            )
+    if recent:
+        lines += ["", "Recent calls (newest first):"]
+        for c in recent:
+            lines.append(
+                f"  [{c['ts']}] {c['call_type']:<16} {_short(c['model']):<10}"
+                f"  in {c['input_tokens']:>5,} out {c['output_tokens']:>5,}"
+                f"  ${c['cost_usd']:.4f}  [{c['concept_id']}]"
             )
     await _send(context, update.effective_chat.id, "\n".join(lines))
 
